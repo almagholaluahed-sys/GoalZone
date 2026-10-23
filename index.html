@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Face State Tracker</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #0e0f12; color: #e8e8ea; font: 14px system-ui, sans-serif; }
+  body { display: flex; flex-direction: column; }
+  #stage { position: relative; flex: 1; min-height: 0; background: #000; overflow: hidden; }
+  #mirror { position: absolute; inset: 0; transform: scaleX(-1); }
+  #v, #c { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+  #panel { position: absolute; left: 12px; top: 12px; width: 190px; border: 4px solid #1fd655; background: #f5f5f5; }
+  #panel.alert { border-color: #ff3b3b; }
+  #pimg { display: block; width: 100%; aspect-ratio: 1; object-fit: cover; background: #f5f5f5; }
+  #plabel { padding: 6px 8px; font: 700 13px ui-monospace, monospace; background: #cfcfcf; color: #1fa84a; }
+  #panel.alert #plabel { color: #d62020; }
+  #bar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding: 10px 16px; background: #17181c; }
+  button, label.btn { background: #2b2d34; color: inherit; border: 1px solid #44464f; border-radius: 6px; padding: 9px 14px; font: inherit; cursor: pointer; }
+  #info { margin-left: auto; font: 12px ui-monospace, monospace; color: #9a9ca6; }
+  input[type=file] { display: none; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="mirror"><video id="v" playsinline muted></video><canvas id="c"></canvas></div>
+  <div id="panel"><img id="pimg" alt=""><div id="plabel">STATE: NORMAL</div></div>
+</div>
+<div id="bar">
+  <button id="start">Start camera</button>
+  <label class="btn" for="files">Load images</label>
+  <input id="files" type="file" accept="image/*" multiple>
+  <button id="gl">Glasses: off</button>
+  <span id="info">Name images: normal, shocked, smile, thinking, eyes_closed, looking_away, glasses</span>
+</div>
+
+<script type="module">
+import { FaceLandmarker, HandLandmarker, FilesetResolver }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const STATES = {
+  normal:       ["NORMAL", false],
+  glasses:      ["GLASSES", false],
+  smile:        ["SMILE", false],
+  thinking:     ["THINKING", false],
+  eyes_closed:  ["EYES CLOSED", true],
+  looking_away: ["LOOKING AWAY", true],
+  shocked:      ["SHOCKED", true],
+};
+const $ = id => document.getElementById(id);
+const video = $("v"), canvas = $("c"), ctx = canvas.getContext("2d");
+const panel = $("panel"), pimg = $("pimg"), plabel = $("plabel"), info = $("info");
+
+// ---- reaction images (loaded by file name) + text-card fallback
+const images = {};
+function card(label) {
+  const c = document.createElement("canvas"); c.width = c.height = 300;
+  const g = c.getContext("2d");
+  g.fillStyle = "#f5f5f5"; g.fillRect(0, 0, 300, 300);
+  g.fillStyle = "#444"; g.font = "bold 28px sans-serif"; g.textAlign = "center";
+  g.fillText(label, 150, 160);
+  return c.toDataURL();
+}
+function showState(key) {
+  const [label, alert] = STATES[key];
+  pimg.src = images[key] || card(label);
+  plabel.textContent = "STATE: " + label;
+  panel.classList.toggle("alert", alert);
+}
+$("files").addEventListener("change", e => {
+  for (const f of e.target.files) {
+    const key = f.name.replace(/\.[^.]+$/, "").toLowerCase();
+    if (STATES[key]) images[key] = URL.createObjectURL(f);
+  }
+  showState(state);
+});
+
+let glasses = false;
+$("gl").onclick = () => { glasses = !glasses; $("gl").textContent = "Glasses: " + (glasses ? "on" : "off"); };
+
+// ---- landmark helpers
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+function eyeRatio(P, top, bot, a, b) { return dist(P[top], P[bot]) / (dist(P[a], P[b]) + 1e-6); }
+
+function headPose(m) {              // m: column-major 4x4 from MediaPipe
+  const R = (r, c) => m[c * 4 + r];
+  const sy = Math.hypot(R(0, 0), R(1, 0));
+  const d = 180 / Math.PI;
+  return {
+    pitch: Math.atan2(R(2, 1), R(2, 2)) * d,
+    yaw:   Math.atan2(-R(2, 0), sy) * d,
+    roll:  Math.atan2(R(1, 0), R(0, 0)) * d,
+    R,
+  };
+}
+
+function classify(P, hands, yaw) {
+  const faceW = dist(P[234], P[454]) + 1e-6;
+  const faceH = dist(P[10], P[152]) + 1e-6;
+  const mouthOpen = dist(P[13], P[14]) / faceH;
+  const mouthW = dist(P[61], P[291]) / faceW;
+  const ear = (eyeRatio(P, 159, 145, 33, 133) + eyeRatio(P, 386, 374, 362, 263)) / 2;
+
+  let handNear = false;
+  for (const h of hands) for (const t of [4, 8, 12]) {
+    const tip = h[t];
+    if (Math.min(dist(tip, P[152]), dist(tip, P[13])) < 0.35 * faceH) handNear = true;
+  }
+  if (Math.abs(yaw) > 30) return "looking_away";
+  if (mouthOpen > 0.12) return "shocked";
+  if (handNear) return "thinking";
+  if (ear < 0.12) return "eyes_closed";
+  if (mouthW > 0.42 && mouthOpen < 0.08) return "smile";
+  if (glasses) return "glasses";
+  return "normal";
+}
+
+// ---- main loop
+let state = "normal", candidate = "normal", streak = 0;
+let faceLm, handLm, running = false, lastT = -1;
+
+async function init() {
+  info.textContent = "Loading models...";
+  const fileset = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  faceLm = await FaceLandmarker.createFromOptions(fileset, {
+    baseOptions: { modelAssetPath:
+      "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+      delegate: "GPU" },
+    runningMode: "VIDEO", numFaces: 1, outputFacialTransformationMatrixes: true,
+  });
+  handLm = await HandLandmarker.createFromOptions(fileset, {
+    baseOptions: { modelAssetPath:
+      "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+      delegate: "GPU" },
+    runningMode: "VIDEO", numHands: 2,
+  });
+}
+
+function drawAxes(P, pose, w, h) {
+  const o = P[1], L = 0.12 * h;
+  const cols = ["#ff4040", "#40ff40", "#4090ff"];
+  for (let i = 0; i < 3; i++) {
+    ctx.strokeStyle = cols[i]; ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(o.x * w, o.y * h);
+    ctx.lineTo(o.x * w + pose.R(0, i) * L, o.y * h - pose.R(1, i) * L);
+    ctx.stroke();
+  }
+  ctx.fillStyle = "#b6ff3c";
+  for (const i of [33, 263, 61, 291, 13, 14, 1, 152])
+    { ctx.beginPath(); ctx.arc(P[i].x * w, P[i].y * h, 3, 0, 7); ctx.fill(); }
+}
+
+function loop() {
+  if (!running) return;
+  if (video.readyState >= 2 && video.currentTime !== lastT) {
+    lastT = video.currentTime;
+    const w = canvas.width = video.videoWidth, h = canvas.height = video.videoHeight;
+    ctx.clearRect(0, 0, w, h);
+    const now = performance.now();
+    const fr = faceLm.detectForVideo(video, now);
+    const hr = handLm.detectForVideo(video, now);
+    const P = fr.faceLandmarks[0];
+    if (P && fr.facialTransformationMatrixes[0]) {
+      const pose = headPose(fr.facialTransformationMatrixes[0].data);
+      drawAxes(P, pose, w, h);
+      // work in pixel-aspect space so distances aren't skewed by w != h
+      const scale = p => ({ x: p.x * w, y: p.y * h });
+      const Pp = P.map(scale), Hp = hr.landmarks.map(hand => hand.map(scale));
+      const next = classify(Pp, Hp, pose.yaw);
+      streak = next === candidate ? streak + 1 : 1;
+      candidate = next;
+      if (streak >= 3 && candidate !== state) { state = candidate; showState(state); }
+      info.textContent = `pitch ${pose.pitch.toFixed(0)}  yaw ${pose.yaw.toFixed(0)}  roll ${pose.roll.toFixed(0)}`;
+    }
+  }
+  requestAnimationFrame(loop);
+}
+
+$("start").onclick = async () => {
+  try {
+    $("start").disabled = true;
+    if (!faceLm) await init();
+    video.srcObject = await navigator.mediaDevices.getUserMedia(
+      { video: { facingMode: "user", width: { ideal: 960 }, height: { ideal: 720 } }, audio: false });
+    await video.play();
+    $("start").textContent = "Running";
+    running = true; loop();
+  } catch (e) {
+    $("start").disabled = false;
+    info.textContent = "Error: " + e.message;
+  }
+};
+showState("normal");
+</script>
+</body>
+</html>
